@@ -225,7 +225,6 @@ static MetaKeyIndex keyUseEffect     (KEY_USEEFFECT     );
 static MetaKeyIndex keyUseAction     (KEY_USEACTION     );
 static MetaKeyIndex keyUseSound      (KEY_USESOUND      );
 static MetaKeyIndex keyArgs          (KEY_ARGS          );
-static MetaKeyIndex keyUndroppable   (KEY_UNDROPPABLE   );
 
 // Keys for specially treated artifact types
 static MetaKeyIndex keyBackpackItem  (ARTI_BACKPACKITEM );
@@ -1418,7 +1417,7 @@ int E_GiveAllKeys(player_t &player)
 // Take away every artifact a player has that is of "key" type.
 // Returns the number of keys taken away.
 //
-int E_TakeAllKeys(player_t &player)
+int E_TakeAllKeys(const player_t &player)
 {
     size_t numKeys   = E_GetNumKeyItems();
     int    keysTaken = 0;
@@ -1886,15 +1885,14 @@ static useaction_t *E_addUseAction(itemeffect_t *artifact)
 //
 // E_TryUseItem
 //
-// Tries to use the currently selected item
-// Returns true if item was successfully used, otherwise false
+// Tries to use the currently selected item.
 //
-bool E_TryUseItem(player_t &player, inventoryitemid_t ID)
+void E_TryUseItem(player_t &player, inventoryitemid_t ID)
 {
     invbarstate_t &invbarstate = player.invbarstate;
     itemeffect_t  *artifact    = E_EffectForInventoryItemID(ID);
     if(!artifact)
-        return false;
+        return;
     if(E_getItemEffectType(artifact) == ITEMFX_ARTIFACT)
     {
         if(artifact->getInt(keyArtifactType, -1) == ARTI_NORMAL)
@@ -1920,7 +1918,7 @@ bool E_TryUseItem(player_t &player, inventoryitemid_t ID)
                     success = P_GivePowerForItem(player, effect);
                     break;
                 default: //
-                    return false;
+                    return;
                 }
             }
 
@@ -1974,11 +1972,8 @@ bool E_TryUseItem(player_t &player, inventoryitemid_t ID)
                 // FIXME: Make this behaviour optional, or remove
                 E_MoveInventoryCursor(player, -1, player.inv_ptr);
             }
-
-            return success;
         }
     }
-    return false;
 }
 
 //
@@ -2229,7 +2224,7 @@ bool E_GiveBackpack(player_t &player)
 //
 // Special function to remove a backpack.
 //
-bool E_RemoveBackpack(player_t &player)
+bool E_RemoveBackpack(const player_t &player)
 {
     auto          backpackItem = runtime_cast<itemeffect_t *>(e_effectsTable.getObject(keyBackpackItem));
     bool          removed      = false;
@@ -2327,7 +2322,7 @@ bool E_PlayerHasPowerName(const player_t &player, const char *name)
 //
 // Place an artifact effect into the player's inventory, if it will fit.
 //
-bool E_GiveInventoryItem(player_t &player, const itemeffect_t *artifact, int amount, bool givemax)
+bool E_GiveInventoryItem(player_t &player, const itemeffect_t *artifact, int amount)
 {
     if(!artifact)
         return false;
@@ -2343,9 +2338,8 @@ bool E_GiveInventoryItem(player_t &player, const itemeffect_t *artifact, int amo
     int              amountToGive = artifact->getInt(keyAmount, 1);
     int              maxAmount    = E_GetMaxAmountForArtifact(player, artifact);
 
-    if(givemax)
-        amountToGive = maxAmount;
-    else if(amount > 0) // may override amount to give via parameter "amount", if > 0
+    // may override amount to give via parameter "amount", if > 0
+    if(amount > 0)
         amountToGive = amount;
 
     // Does the player already have this item?
@@ -2424,11 +2418,7 @@ static void E_removeInventorySlot(const player_t *player, inventoryslot_t *slot)
 // Remove some amount of a specific item from the player's inventory, if
 // possible. If amount is less than zero, then all of the item will be removed.
 //
-// If removemore is true, then if the amount is greater than what is actually
-// in the inventory, everything will be removed. For compatibility reasons,
-// this parameter is false by default.
-//
-itemremoved_e E_RemoveInventoryItem(player_t &player, const itemeffect_t *artifact, int amount, bool removemore)
+itemremoved_e E_RemoveInventoryItem(const player_t &player, const itemeffect_t *artifact, int amount)
 {
     inventoryslot_t *slot = E_InventorySlotForItem(player, artifact);
 
@@ -2440,14 +2430,9 @@ itemremoved_e E_RemoveInventoryItem(player_t &player, const itemeffect_t *artifa
     if(amount < 0)
         amount = slot->amount;
 
+    // don't own that many?
     if(slot->amount < amount)
-    {
-        if(removemore)
-            amount = slot->amount;
-        else
-            // don't own that many?
-            return INV_NOTREMOVED;
-    }
+        return INV_NOTREMOVED;
 
     itemremoved_e ret = INV_REMOVED;
 
@@ -2468,9 +2453,6 @@ itemremoved_e E_RemoveInventoryItem(player_t &player, const itemeffect_t *artifa
         }
     }
 
-    // Give the player a empty weapon if they have no weapons left
-    E_PlayerHasAnyWeapons(player, true);
-
     return ret;
 }
 
@@ -2481,7 +2463,7 @@ itemremoved_e E_RemoveInventoryItem(player_t &player, const itemeffect_t *artifa
 // function to strip all inventory items that are not meant to remain across
 // levels to their max hub amount.
 //
-void E_InventoryEndHub(player_t *player)
+void E_InventoryEndHub(const player_t *player)
 {
     for(inventoryindex_t i = 0; i < e_maxitemid; i++)
     {
@@ -2507,23 +2489,13 @@ void E_InventoryEndHub(player_t *player)
 // E_ClearInventory
 //
 // Completely clear a player's inventory.
-// If undroppable is true, undroppable items will be kept.
-// If setemptyweapon is true, the player will be given an empty weapon when done.
 //
-void E_ClearInventory(player_t *player, bool undroppable, bool setemptyweapon)
+void E_ClearInventory(player_t *player)
 {
     invbarstate_t &invbarstate = player->invbarstate;
 
     for(inventoryindex_t i = 0; i < e_maxitemid; i++)
     {
-        if(!undroppable)
-        {
-            itemeffect_t *item = E_EffectForInventoryIndex(*player, i);
-            if(!(item &&
-                 !(item->getInt(keyUndroppable, 0) && item->getInt(keyArtifactType, ARTI_NORMAL) != ARTI_WEAPON)))
-                continue;
-        }
-
         player->inventory[i].amount = 0;
         player->inventory[i].item   = -1;
         // Also unmorph inventory
@@ -2533,10 +2505,6 @@ void E_ClearInventory(player_t *player, bool undroppable, bool setemptyweapon)
 
     player->inv_ptr = 0;
     invbarstate     = { false, 0 };
-
-    // Give the player a empty weapon if they have no weapons left
-    if(setemptyweapon)
-        E_PlayerHasAnyWeapons(*player, true);
 }
 
 //

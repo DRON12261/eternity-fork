@@ -66,7 +66,6 @@
 #include "v_misc.h"
 #include "doomstat.h"
 #include "metaapi.h"
-#include "e_lib.h"
 
 #include "ACSVM/Scope.hpp"
 #include "ACSVM/Thread.hpp"
@@ -856,6 +855,30 @@ bool ACS_CF_GetCVarString(ACS_CF_ARGS)
     }
 
     thread->dataStk.push(~ACSenv.getString(C_VariableValue(var))->idx);
+    return false;
+}
+
+//
+// int CheckInventory(str itemname);
+//
+bool ACS_CF_CheckInventory(ACS_CF_ARGS)
+{
+    auto          info     = &static_cast<ACSThread *>(thread)->info;
+    char const   *itemname = thread->scopeMap->getString(argV[0])->str;
+    itemeffect_t *item     = E_ItemEffectForName(itemname);
+
+    // We could use E_GetItemOwnedAmountName but let's inform the player if stuff's broke
+    if(!item)
+    {
+        doom_printf("ACS_CF_CheckInventory: Inventory item '%s' not found\a\n", itemname);
+        thread->dataStk.push(0);
+        return false;
+    }
+
+    if(!info->mo || !info->mo->player)
+        thread->dataStk.push(0);
+    else
+        thread->dataStk.push(E_GetItemOwnedAmount(*info->mo->player, item));
     return false;
 }
 
@@ -2629,32 +2652,6 @@ bool ACS_CF_StopSound(ACS_CF_ARGS)
 }
 
 //
-// int CheckInventory(str itemname);
-//
-bool ACS_CF_CheckInventory(ACS_CF_ARGS)
-{
-    auto          info     = &static_cast<ACSThread *>(thread)->info;
-    char const   *itemname = thread->scopeMap->getString(argV[0])->str;
-    itemeffect_t *item     = E_ItemEffectForName(itemname);
-    const int     powernum = E_StrToNumLinear(powerStrings, NUMPOWERS, itemname);
-
-    // If the item doesn't exist as an item or a power, complain
-    if(!item && powernum == NUMPOWERS)
-    {
-        doom_printf("ACS_CF_CheckInventory: Inventory item '%s' not found\a\n", itemname);
-        thread->dataStk.push(0);
-        return false;
-    }
-
-    if(!info->mo || !info->mo->player)
-        thread->dataStk.push(0);
-    else
-        thread->dataStk.push(P_CheckInventory(info->mo->player, item, powernum));
-
-    return false;
-}
-
-//
 // void GiveInventory(str itemname, int amount);
 //
 bool ACS_CF_GiveInventory(ACS_CF_ARGS)
@@ -2663,33 +2660,40 @@ bool ACS_CF_GiveInventory(ACS_CF_ARGS)
     char const         *itemname = thread->scopeMap->getString(argV[0])->str;
     const int           amount   = argV[1];
     itemeffect_t *const item     = E_ItemEffectForName(itemname);
-    const int           powernum = E_StrToNumLinear(powerStrings, NUMPOWERS, itemname);
 
-    // If the item doesn't exist as an item or a power, complain
-    if(!item && powernum == NUMPOWERS)
+    if(!item)
     {
         doom_printf("ACS_CF_GiveInventory: Inventory item '%s' not found\a\n", itemname);
         return false;
     }
 
-    // if amount is 0, do nothing
-    // if amount is negative, it means give maximum
-    if(amount == 0)
+    // Handle negative amounts: treat as 0 (don't give anything)
+    if(amount <= 0)
         return false;
 
+    auto giveToPlayer = [item, amount](player_t *player) {
+        switch(item->getInt("class", ITEMFX_NONE))
+        {
+        case ITEMFX_HEALTH: P_GiveBody(*player, item, amount); break;
+        case ITEMFX_ARMOR:  P_GiveArmor(*player, item, amount); break;
+        case ITEMFX_AMMO:   P_GiveAmmoPickup(*player, item, false, 0, amount); break;
+        case ITEMFX_POWER:  P_GivePowerForItem(*player, item, amount); break;
+        default:            E_GiveInventoryItem(*player, item, amount); break;
+        }
+    };
 
     if(info->mo)
     {
         // FIXME: Needs to be adapted for when Mobjs get inventory if they get inventory
         if(info->mo->player)
-            P_GiveInventory(info->mo->player, item, amount, powernum);
+            giveToPlayer(info->mo->player);
     }
     else
     {
         for(int pnum = 0; pnum != MAXPLAYERS; ++pnum)
         {
             if(playeringame[pnum])
-                P_GiveInventory(&players[pnum], item, amount, powernum);
+                giveToPlayer(&players[pnum]);
         }
     }
     return false;
@@ -2704,104 +2708,37 @@ bool ACS_CF_TakeInventory(ACS_CF_ARGS)
     char const         *itemname = thread->scopeMap->getString(argV[0])->str;
     const int           amount   = argV[1];
     itemeffect_t *const item     = E_ItemEffectForName(itemname);
-    const int           powernum = E_StrToNumLinear(powerStrings, NUMPOWERS, itemname);
 
-    // If the item doesn't exist as an item or a power, complain
-    if(!item && powernum == NUMPOWERS)
+    if(!item)
     {
         doom_printf("ACS_CF_TakeInventory: Inventory item '%s' not found\a\n", itemname);
         return false;
     }
 
-    // if amount is 0, do nothing
-    // if amount is negative, it means take all
-    if(amount == 0)
+    // Handle negative amounts: treat as 0 (don't remove anything)
+    if(amount <= 0)
         return false;
+
+    auto alwaysRemove = [info, item, amount]() {
+        int owned = E_GetItemOwnedAmount(*info->mo->player, item);
+        // If amount exceeds what player has, take all they have
+        E_RemoveInventoryItem(*info->mo->player, item, emin(owned, amount));
+    };
 
     if(info->mo)
     {
         // FIXME: Needs to be adapted for when Mobjs get inventory if they get inventory
         if(info->mo->player)
-            P_TakeInventory(info->mo->player, item, amount, powernum);
+            alwaysRemove();
     }
     else
     {
         for(int pnum = 0; pnum != MAXPLAYERS; ++pnum)
         {
             if(playeringame[pnum])
-                P_TakeInventory(&players[pnum], item, amount, powernum);
+                alwaysRemove();
         }
     }
-    return false;
-}
-
-//
-// void ClearInventory();
-//
-bool ACS_CF_ClearInventory(ACS_CF_ARGS)
-{
-    const auto info = &static_cast<ACSThread *>(thread)->info;
-
-    if(info->mo)
-    {
-        // FIXME: Needs to be adapted for when Mobjs get inventory if they get inventory
-        if(info->mo->player)
-            P_ClearInventory(info->mo->player);
-    }
-    else
-    {
-        for(int pnum = 0; pnum != MAXPLAYERS; ++pnum)
-        {
-            if(playeringame[pnum])
-                P_ClearInventory(&players[pnum]);
-        }
-    }
-
-    return false;
-}
-
-//
-// void UseInventory(str itemname);
-//
-bool ACS_CF_UseInventory(ACS_CF_ARGS)
-{
-    auto                info     = &static_cast<ACSThread *>(thread)->info;
-    char const         *itemname = thread->scopeMap->getString(argV[0])->str;
-    itemeffect_t *const item     = E_ItemEffectForName(itemname);
-
-    if(!info->mo || !info->mo->player)
-        thread->dataStk.push(0);
-    else
-        thread->dataStk.push(P_UseInventory(info->mo->player, item));
-
-    return false;
-}
-
-//
-// void GetMaxInventory(int tid, str itemname);
-//
-bool ACS_CF_GetMaxInventory(ACS_CF_ARGS)
-{
-    auto          info     = &static_cast<ACSThread *>(thread)->info;
-    const int     tid      = argV[0]; // FIXME: Needs to be adapted for nonplayer Mobjs
-    Mobj         *mo       = P_FindMobjFromTID(tid, nullptr, info->mo);
-    char const   *itemname = thread->scopeMap->getString(argV[1])->str;
-    itemeffect_t *item     = E_ItemEffectForName(itemname);
-    const int     powernum = E_StrToNumLinear(powerStrings, NUMPOWERS, itemname);
-
-    // If the item doesn't exist as an item or a power, complain
-    if(!item && powernum == NUMPOWERS)
-    {
-        doom_printf("ACS_CF_GetMaxInventory: Inventory item '%s' not found\a\n", itemname);
-        thread->dataStk.push(0);
-        return false;
-    }
-
-    if(!mo || !mo->player)
-        thread->dataStk.push(0);
-    else
-        thread->dataStk.push(P_GetMaxInventory(mo->player, item, powernum));
-
     return false;
 }
 
