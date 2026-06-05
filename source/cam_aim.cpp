@@ -31,8 +31,10 @@
 #include "d_player.h"
 #include "e_exdata.h"
 #include "m_compare.h"
+#include "p_info.h"
 #include "p_mobj.h"
 #include "p_portal.h"
+#include "polyobj.h"
 #include "r_defs.h"
 #include "r_main.h"
 #include "r_pcheck.h"
@@ -275,8 +277,18 @@ bool AimContext::aimTraverse(intercept_t *in, void *vdata, const divline_t &trac
     const sector_t *sector;
     const line_t   *li = in->d.line;
     Mobj           *th = in->d.thing;
+
+    v2fixed_t edgepos{};
+    bool      polyline = false; // silence stupid warnings
     if(in->isaline)
-        sector = P_PointOnLineSidePrecise(trace.x, trace.y, li) == 0 ? li->frontsector : li->backsector;
+    {
+        edgepos  = trace.v + trace.dv.fixedMul(in->frac);
+        polyline = Polyobj_IsLine(*li);
+        if(polyline)
+            sector = R_PointInSubsector(edgepos)->sector;
+        else
+            sector = P_PointOnLineSidePrecise(trace.x, trace.y, li) == 0 ? li->frontsector : li->backsector;
+    }
     else
         sector = th->subsector->sector;
     if(sector && totaldist > 0)
@@ -292,24 +304,36 @@ bool AimContext::aimTraverse(intercept_t *in, void *vdata, const divline_t &trac
         if(!(li->flags & ML_TWOSIDED) || li->extflags & EX_ML_BLOCKALL)
             return false;
 
-        v2fixed_t          edgepos = trace.v + trace.dv.fixedMul(in->frac);
-        tracelineopening_t lo      = { 0 };
+        tracelineopening_t lo = { 0 };
         lo.calculateAtPoint(*li, edgepos);
 
         if(lo.openrange <= 0)
             return false;
 
-        const sector_t *osector = sector == li->frontsector ? li->backsector : li->frontsector;
-        fixed_t         slope;
+        const sector_t *osector;
+        v2fixed_t       edgepos2 = edgepos;
+        if(li->intflags & MLI_1SPORTALLINE && li->beyondportalline)
+        {
+            osector = li->beyondportalline->frontsector;
+            if(li->portal && li->portal->type == R_LINKED)
+            {
+                edgepos2.x += li->portal->data.link.delta.x;
+                edgepos2.y += li->portal->data.link.delta.y;
+            }
+        }
+        else if(polyline)
+            osector = sector;
+        else
+            osector = sector == li->frontsector ? li->backsector : li->frontsector;
+        fixed_t slope;
 
         for(surf_e surf : SURFS)
         {
             const surface_t &surface      = sector->srf[surf];
             const surface_t &otherSurface = osector->srf[surf];
 
-            if((surface.getZAt(edgepos) != otherSurface.getZAt(edgepos) ||
-                (surface.pflags & PS_PASSABLE) != (otherSurface.pflags & PS_PASSABLE)) &&
-               lo.openrange < D_MAXINT)
+            if(surface.getZAt(edgepos) != otherSurface.getZAt(edgepos2) ||
+               (surface.pflags & PS_PASSABLE) != (otherSurface.pflags & PS_PASSABLE))
             {
                 slope = FixedDiv(lo.open[surf] - context.state.c.z, totaldist);
                 if(isInner(surf, slope, context.state.slope[surf]))
@@ -404,4 +428,3 @@ fixed_t CAM_AimLineAttack(const Mobj *t1, angle_t angle, fixed_t distance, bool 
 }
 
 // EOF
-

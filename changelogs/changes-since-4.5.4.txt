@@ -91,6 +91,10 @@ Improvements
 * Fixed so the Heretic ghost translucency takes precedence over the weaker (by TRANMAP) Boom default translucency.
 * Added some readily available APROP implementations to the GetActorProperty and CheckActorProperty ACS functions.
 * Fixed so Doom teleportation also works fine with Heretic-like flying players or telestomp projectiles.
+* Added missing "3DMTPASSPROJ" extflag to ExtraData linedef entries.
+* WRAPMIDTEX applied over 3DMIDTEX now modifies the behavior so the line blocks the entire space.
+* Polyobjects with impassable 2-sided lines (of any flavour) can now carry and properly push (or not push) things.
+* Polyobjects with passable 2-sided lines can now cause actors to trigger their walkover specials when moving into them.
 
 Bug fixes
 ---------
@@ -149,3 +153,4 @@ Bug fixes
 * Fixed lock-up caused by polyobject mirror cycles and override specials.
 * Fixed default melee range still being wrongly used despite possibility to customize it, for some
   cases.
+* Fixed clip or wrap midtextures bleeding too far when viewed through a sector portal.

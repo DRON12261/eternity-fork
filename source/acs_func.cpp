@@ -2008,6 +2008,12 @@ bool ACS_CF_SectorDamage(ACS_CF_ARGS)
     return false;
 }
 
+// Gets line frontsector, or polyobject sector otherwise
+inline static sector_t &ACS_getLineSector(const line_t &line)
+{
+    return Polyobj_IsLine(line) ? *R_PointInSubsector(line.soundorg.x, line.soundorg.y)->sector : *line.frontsector;
+}
+
 //
 // ACS_CF_SectorSound
 //
@@ -2021,8 +2027,9 @@ bool ACS_CF_SectorSound(ACS_CF_ARGS)
     PointThinker *src;
 
     // if script started from a line, use the frontsector's sound origin
-    if(info->line)
-        src = &(info->line->frontsector->soundorg);
+    const line_t *const line = info->line;
+    if(line)
+        src = &ACS_getLineSector(*line).soundorg;
     else
         src = nullptr;
 
@@ -2732,8 +2739,8 @@ bool ACS_CF_SoundSequence(ACS_CF_ARGS)
     const char *snd  = thread->scopeMap->getString(argV[0])->str;
     sector_t   *sec;
 
-    if(info->line && (sec = info->line->frontsector))
-        S_StartSectorSequenceName(sec, snd, SEQ_ORIGIN_SECTOR_F);
+    if(info->line)
+        S_StartSectorSequenceName(&ACS_getLineSector(*info->line), snd, SEQ_ORIGIN_SECTOR_F);
     else
         S_StartSequenceName(nullptr, snd, SEQ_ORIGIN_OTHER, -1);
 

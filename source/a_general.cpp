@@ -1731,4 +1731,3 @@ void A_SelfDestruct(actionargs_t *actionargs)
 }
 
 // EOF
-
