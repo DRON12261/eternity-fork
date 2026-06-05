@@ -65,18 +65,20 @@ void tracelineopening_t::calculateAtPoint(const line_t &line, v2fixed_t pos)
 
     const sector_t *front;
     const sector_t *back;
-    if(isPolyObj2Sided)
+    if(isPolyObj2Sided && !(line.intflags & MLI_1SPORTALLINE))
     {
         // For a polyobject 2-sided line, we don't actually have a top and bottom limit -- that's established by static
         // lines
-        open.floor   = D_MININT;
-        open.ceiling = D_MAXINT;
-        openrange    = D_MAXINT;
+        const sector_t *sector = R_PointInSubsector(pos)->sector;
+
+        open.floor   = sector->srf.floor.getZAt(pos);
+        open.ceiling = sector->srf.ceiling.getZAt(pos);
+        openrange    = open.ceiling - open.floor;
         return;
     }
     else
     {
-        front = line.frontsector;
+        front = isPolyObj2Sided ? R_PointInSubsector(pos)->sector : line.frontsector;
         back  = line.backsector;
     }
 
@@ -107,4 +109,3 @@ void tracelineopening_t::calculateAtPoint(const line_t &line, v2fixed_t pos)
 }
 
 // EOF
-

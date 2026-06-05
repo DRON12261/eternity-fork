@@ -466,7 +466,7 @@ static bool PIT_CheckThing3D(Mobj *thing) // killough 3/26/98: make static
 //
 // A 3D version of P_CheckPosition.
 //
-bool P_CheckPosition3D(Mobj *thing, fixed_t x, fixed_t y, PODCollection<line_t *> *pushhit)
+bool P_CheckPosition3D(Mobj *thing, fixed_t x, fixed_t y, PODCollection<line_t *> *pushhit, UnstuckCheck unstuckCheck)
 {
     const fixed_t realheight = thing->height;
 
@@ -477,7 +477,7 @@ bool P_CheckPosition3D(Mobj *thing, fixed_t x, fixed_t y, PODCollection<line_t *
 
     const sector_t *bottomsector;
     const sector_t *topsector;
-    P_GetClipBasics(*thing, x, y, clip, bottomsector, topsector);
+    P_GetClipBasics(*thing, x, y, clip, bottomsector, topsector, unstuckCheck);
 
     // haleyjd 06/28/06: skullfly check from zdoom
     if(clip.thing->flags & MF_NOCLIP && !(clip.thing->flags & MF_SKULLFLY))
@@ -1173,21 +1173,18 @@ bool P_ChangeSector3D(sector_t *sector, int crunch, int amt, CheckSectorPlane pl
     // Mark all things invalid
 
     for(n = sector->touching_thinglist; n; n = n->m_snext)
-        n->visited = false;
+        n->flags &= ~MSN_VISITED;
 
     do
     {
         for(n = sector->touching_thinglist; n; n = n->m_snext) // go through list
         {
             // ioanch 20160115: portal aware
-            if(useportalgroups && full_demo_version >= make_full_version(340, 48) &&
-               !P_SectorTouchesThingVertically(sector, n->m_thing))
-            {
+            if(!P_SectorTouchesThingVertically(sector, n->m_thing))
                 continue;
-            }
-            if(!n->visited) // unprocessed thing found
+            if(!(n->flags & MSN_VISITED)) // unprocessed thing found
             {
-                n->visited = true;                       // mark thing as processed
+                n->flags |= MSN_VISITED;                 // mark thing as processed
                 if(!(n->m_thing->flags & MF_NOBLOCKMAP)) // jff 4/7/98 don't do these
                 {
                     iterator(n->m_thing); // process it

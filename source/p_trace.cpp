@@ -139,16 +139,18 @@ static bool PTR_AimTraverse(intercept_t *in, void *context, const divline_t &tra
 
         dist = FixedMul(trace.attackrange, in->frac);
 
-        if(li->frontsector->srf.floor.getZAt(edgepos) != li->backsector->srf.floor.getZAt(edgepos) &&
-           (demo_version < 406 || clip.open.height.floor != D_MININT))
+        const sector_t *const frontsector = Polyobj_IsLine(*li) ? R_PointInSubsector(edgepos)->sector : li->frontsector;
+        const sector_t *const backsector  = Polyobj_IsLine(*li) ? frontsector : li->backsector;
+        // IMPORTANT: no portals here, no 1sportalline or edgepos2
+
+        if(frontsector->srf.floor.getZAt(edgepos) != backsector->srf.floor.getZAt(edgepos))
         {
             slope = FixedDiv(clip.open.height.floor - trace.z, dist);
             if(slope > trace.bottomslope)
                 trace.bottomslope = slope;
         }
 
-        if(li->frontsector->srf.ceiling.getZAt(edgepos) != li->backsector->srf.ceiling.getZAt(edgepos) &&
-           (demo_version < 406 || clip.open.height.ceiling != D_MAXINT))
+        if(frontsector->srf.ceiling.getZAt(edgepos) != backsector->srf.ceiling.getZAt(edgepos))
         {
             slope = FixedDiv(clip.open.height.ceiling - trace.z, dist);
             if(slope < trace.topslope)
@@ -370,6 +372,7 @@ static bool PTR_ShootTraverseVanilla(intercept_t *in, void *context, const divli
 
         if(li->flags & ML_TWOSIDED)
         {
+            // NOTE: no polyobjects in vanilla, no worry there. No Hexen demo support either.
             clip.open    = P_LineOpening(li, nullptr);
             fixed_t dist = FixedMul(trace.attackrange, in->frac);
             fixed_t slope;
@@ -440,27 +443,30 @@ static bool P_Shoot2SLine(line_t *li, int side, fixed_t dist)
     // haleyjd: when allowing planes to be shot, we do not care if
     // the sector heights are the same; we must check against the
     // line opening, otherwise lines behind the plane will be activated.
-    sector_t *fs = li->frontsector;
-    sector_t *bs = li->backsector;
+    bool floorsame, ceilingsame;
 
+    // NOTE: MLI_1SPORTALLINE won't be reached here, this is not portal-aware code
     bool becomp = (demo_version < 333 || getComp(comp_planeshoot));
-
-    bool floorsame;
-    if(fs->srf.floor.slope || bs->srf.floor.slope) // don't support this in case of slopes
-        floorsame = false;
+    if(Polyobj_IsLine(*li))
+        floorsame = ceilingsame = becomp;
     else
-        floorsame = becomp && P_SlopesEqual(fs, bs, surf_floor);
+    {
+        sector_t *fs = li->frontsector;
+        sector_t *bs = li->backsector;
 
-    bool ceilingsame;
-    if(fs->srf.ceiling.slope || bs->srf.ceiling.slope)
-        ceilingsame = false;
-    else
-        ceilingsame = becomp && P_SlopesEqual(fs, bs, surf_ceil);
+        if(fs->srf.floor.slope || bs->srf.floor.slope) // don't support this in case of slopes
+            floorsame = false;
+        else
+            floorsame = becomp && P_SlopesEqual(fs, bs, surf_floor);
 
-    if((floorsame || (clip.open.height.floor == D_MININT && demo_version >= 406) ||
-        FixedDiv(clip.open.height.floor - trace.z, dist) <= trace.aimslope) &&
-       (ceilingsame || (clip.open.height.ceiling == D_MAXINT && demo_version >= 406) ||
-        FixedDiv(clip.open.height.ceiling - trace.z, dist) >= trace.aimslope))
+        if(fs->srf.ceiling.slope || bs->srf.ceiling.slope)
+            ceilingsame = false;
+        else
+            ceilingsame = becomp && P_SlopesEqual(fs, bs, surf_ceil);
+    }
+
+    if((floorsame || FixedDiv(clip.open.height.floor - trace.z, dist) <= trace.aimslope) &&
+       (ceilingsame || FixedDiv(clip.open.height.ceiling - trace.z, dist) >= trace.aimslope))
     {
         if(li->special)
             P_ShootSpecialLine(trace.thing, li, side);
@@ -586,17 +592,28 @@ bool P_CheckShootSkyHack(const line_t &li, fixed_t x, fixed_t y, fixed_t z)
 {
     // don't shoot the sky
     // don't shoot ceiling portals either
-    if(R_IsSkyFlat(li.frontsector->srf.ceiling.pic) || li.frontsector->srf.ceiling.portal)
+    const sector_t *frontsector = Polyobj_IsLine(li) ? R_PointInSubsector(x, y)->sector : li.frontsector;
+    if(R_IsSkyFlat(frontsector->srf.ceiling.pic) || frontsector->srf.ceiling.portal)
     {
         // don't shoot the sky!
-        if(z > li.frontsector->srf.ceiling.getZAt(x, y))
+        if(z > frontsector->srf.ceiling.getZAt(x, y))
             return false;
 
         // it's a sky hack wall
         // fix bullet eaters -- killough
-        if(li.backsector && R_IsSkyFlat(li.backsector->srf.ceiling.pic))
+        const sector_t *backsector;
+        if(Polyobj_IsLine(li))
         {
-            if(li.backsector->srf.ceiling.getZAt(x, y) < z)
+            if(li.intflags & MLI_1SPORTALLINE && li.beyondportalline)
+                backsector = li.beyondportalline->frontsector;
+            else
+                backsector = frontsector;
+        }
+        else
+            backsector = li.backsector;
+        if(backsector && R_IsSkyFlat(backsector->srf.ceiling.pic))
+        {
+            if(backsector->srf.ceiling.getZAt(x, y) < z)
                 return false;
         }
     }
@@ -608,6 +625,9 @@ bool P_CheckShootSkyHack(const line_t &li, fixed_t x, fixed_t y, fixed_t z)
 //
 bool P_CheckShootSkyLikeEdgePortal(const line_t &li, v2fixed_t edgepos, fixed_t z)
 {
+    // Applicable neither to two-sided polyobject lines, nor to portal lines (no backsector to give edge portal)
+    if(Polyobj_IsLine(li))
+        return true;
     fixed_t frontceilingz = li.frontsector->srf.ceiling.getZAt(edgepos);
     fixed_t frontfloorz   = li.frontsector->srf.floor.getZAt(edgepos);
     fixed_t backceilingz  = li.backsector ? li.backsector->srf.ceiling.getZAt(edgepos) : 0;
@@ -664,9 +684,13 @@ static bool PTR_ShootTraverse(intercept_t *in, void *vcontext, const divline_t &
         fixed_t z    = trace.z + FixedMul(trace.aimslope, FixedMul(frac, trace.attackrange));
 
         // SoM: Check for collision with a plane.
-        sector_t *sidesector = lineside ? li->backsector : li->frontsector;
-        bool      hitplane   = false;
-        int       updown     = 2;
+        sector_t *sidesector;
+        if(Polyobj_IsLine(*li))
+            sidesector = R_PointInSubsector(edgepos)->sector;
+        else
+            sidesector = lineside ? li->backsector : li->frontsector;
+        bool hitplane = false;
+        int  updown   = 2;
 
         // SoM: If we are in no-clip and are shooting on the backside of a
         // 1s line, don't crash!
@@ -1098,7 +1122,17 @@ static bool PIT_AddLineIntercepts(line_t *ld, polyobj_t *po, void *context)
 
         // if this is a passable portal line, remember we just added it
         // ioanch 20151229: also check sectors
-        const sector_t *fsec = ld->frontsector, *bsec = ld->backsector;
+        const sector_t *fsec, *bsec;
+        if(Polyobj_IsLine(*ld))
+        {
+            v2fixed_t point = info->trace.v + info->trace.dv.fixedMul(frac);
+            fsec = bsec = R_PointInSubsector(point)->sector;
+        }
+        else
+        {
+            fsec = ld->frontsector;
+            bsec = ld->backsector;
+        }
         if(ld->pflags & PS_PASSABLE ||
            (fsec && (fsec->srf.ceiling.pflags & PS_PASSABLE || fsec->srf.floor.pflags & PS_PASSABLE)) ||
            (bsec && (bsec->srf.ceiling.pflags & PS_PASSABLE || bsec->srf.floor.pflags & PS_PASSABLE)))

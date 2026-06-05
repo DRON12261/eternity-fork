@@ -160,7 +160,7 @@ static void P_blockingLineDifferentLevel(line_t *ld, fixed_t thingz, fixed_t thi
         clip.zref.sector.floor = nullptr;
         clip.zref.slope.floor  = nullptr;
 
-        clip.floorline = ld;
+        clip.zref.floorline = ld;
         clip.blockline = ld;
     }
 
@@ -402,7 +402,7 @@ bool PIT_CheckLine3D(line_t *ld, polyobj_t *po, void *context)
                 P_blockingLineDifferentLevel(ld, thingz, thingmid, thingtopz, innerheights, outerheights, pushhit);
                 return true;
             }
-            if(!(ld->flags & ML_3DMIDTEX) && P_BlockedAsMonster(*clip.thing) &&
+            if((!(ld->flags & ML_3DMIDTEX) || ld->extflags & EX_ML_WRAPMIDTEX) && P_BlockedAsMonster(*clip.thing) &&
                (ld->flags & ML_BLOCKMONSTERS ||
                 (mbf21_demo && (ld->flags & ML_BLOCKLANDMONSTERS) && !(clip.thing->flags & MF_FLOAT))))
             {
@@ -410,15 +410,21 @@ bool PIT_CheckLine3D(line_t *ld, polyobj_t *po, void *context)
                 return true;
             }
         }
+        if(P_CheckWrap3DMidTexBlock(*ld, *clip.thing))
+        {
+            P_blockingLineDifferentLevel(ld, thingz, thingmid, thingtopz, innerheights, outerheights, pushhit);
+            return true;
+        }
     }
 
     // TODO: check the sloped line points here
     // better detection of in-portal lines
     uint32_t lineclipflags = 0;
 
-    if(haveSlopes)
+    if(haveSlopes || ld->intflags & MLI_DYNASEGLINE)
     {
-        pcl->haveslopes = true;
+        if(haveSlopes)
+            pcl->haveslopes = true;
         if(!calculatedSlopes) // may have already calculated them when checking cross-portal heights
             P_ExactBoxLinePoints(bbox, *ld, i1, i2);
 
@@ -506,4 +512,3 @@ bool PIT_CheckLine3D(line_t *ld, polyobj_t *po, void *context)
 }
 
 // EOF
-

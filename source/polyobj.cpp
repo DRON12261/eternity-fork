@@ -43,6 +43,7 @@
 #include "p_info.h"
 #include "p_inter.h"
 #include "p_map.h"
+#include "p_map3d.h"
 #include "p_maputl.h"
 #include "p_portal.h"
 #include "p_portalblockmap.h"
@@ -900,9 +901,20 @@ static void Polyobj_pushThing(polyobj_t *po, const line_t *line, Mobj *mo)
     }
 }
 
-inline static bool lineCanCarry(const line_t &line)
+static bool Polyobj_specialLine(const line_t &line)
 {
-    return line.flags & ML_3DMIDTEX && line.flags & ML_TWOSIDED && line.backsector && !(line.flags & ML_BLOCKING) &&
+    if(!(line.flags & ML_TWOSIDED) || !line.backsector)
+        return false;
+    if(line.special)
+        return true; // also include this one
+    int16_t lineflags = line.flags;
+    if(lineflags & ML_RESERVED)
+        lineflags &= ~ML_BLOCKPLAYERS;
+    if(useportalgroups && (line.extflags & EX_ML_BLOCKALL ||
+                           lineflags & (ML_BLOCKING | ML_BLOCKMONSTERS | ML_BLOCKLANDMONSTERS | ML_BLOCKPLAYERS) ||
+                           (lineflags & ML_3DMIDTEX && line.extflags & EX_ML_WRAPMIDTEX)))
+        return true;
+    return lineflags & ML_3DMIDTEX && !(lineflags & ML_BLOCKING) &&
            !(line.extflags & (EX_ML_WRAPMIDTEX | EX_ML_BLOCKALL));
 }
 
@@ -923,6 +935,129 @@ static void Polyobj_makeThingCrossSpecialLine(Mobj &mo, line_t &line, const divl
 }
 #endif
 
+struct PortalAttempt
+{
+    MobjReference mobj;
+    v3fixed_t     oldpos;
+    zrefs_t       oldzref;
+    prevpos_t     oldback;
+    const line_t *line;
+};
+
+struct ClipThings
+{
+    polyobj_t                 &po;
+    const line_t              &line;
+    const divline_t           &oldLinePos;
+    bool                       hitthing;
+    Collection<PortalAttempt> *portalMoves;
+};
+
+static bool Polyobj_checkThingFits(Mobj &thing)
+{
+    if(thing.flags & MF_NOCLIP)
+        return true;
+    if(!P_CheckPosition(&thing, thing.x, thing.y, nullptr, UnstuckCheck::verify))
+        return false;
+    if(clip.zref.ceiling - clip.zref.floor < thing.height)
+        return false;
+    // Don't use the flight move-up/down logic — here we have involuntary blocking
+    if(!(thing.flags & MF_TELEPORT) && clip.zref.ceiling - thing.z < thing.height)
+        return false;
+    if(!(thing.flags & MF_TELEPORT) && !(thing.flags3 & MF3_FLOORMISSILE))
+    {
+        if(clip.zref.floor - thing.z > STEPSIZE)
+            return false;
+        else if(P_Use3DClipping() && thing.z < clip.zref.floor && !P_CheckSpaceToStepUp(thing))
+            return false;
+    }
+
+    if(!P_BouncerCanStepUp(thing, clip.zref.floor))
+        return false;
+
+    // printz: do not reproduce torque step-up limit or CANTLEAVEFLOORPIC (both would happen due to thing's velocity or
+    // will)
+    return true;
+}
+
+static bool PolyobjIT_clipThings(int x, int y, int groupid, void *data)
+{
+    if(x < 0 || y < 0 || x >= bmapwidth || y >= bmapheight)
+        return true;
+
+    auto            context  = static_cast<ClipThings *>(data);
+    const v2fixed_t midpoint = {
+        context->line.v1->x + context->line.dx / 2,
+        context->line.v1->y + context->line.dy / 2,
+    };
+    const sector_t &linesector = *R_PointInSubsector(midpoint)->sector;
+
+    // haleyjd 08/14/10: use modification-safe traversal
+    Mobj *next = nullptr;
+    for(Mobj *mo = blocklinks[y * bmapwidth + x]; mo; mo = next)
+    {
+        next = mo->bnext;
+
+        // always push players even if not solid
+        if(!Polyobj_canPushThing(*mo) || Polyobj_untouched(&context->line, mo) || mo->groupid != groupid ||
+           !P_ThingReachesGroupVertically(mo, context->line.frontsector->groupid,
+                                          linesector.srf.floor.getZAt(mo->x, mo->y) / 2 +
+                                              linesector.srf.ceiling.getZAt(mo->x, mo->y) / 2))
+        {
+            continue;
+        }
+
+        if(!P_LevelIsVanillaHexen() && context->line.flags & ML_TWOSIDED && context->line.backsector &&
+           Polyobj_checkThingFits(*mo) && !(context->line.pflags & PS_PASSABLE))
+        {
+            // Need to check if it would really block, so that passable, 3dmidtex and portal-aware impassable 2-sided
+            // lines don't push if they otherwise may be passed
+
+            // Polyobj_makeThingCrossSpecialLine(*mo, *line, oldLinePos);
+            continue;
+        }
+
+        // ioanch 20160226: in case of portal lines, just make sure
+        // the mobj budges a bit just to detect the specline
+        if(context->line.pflags & PS_PASSABLE)
+        {
+            // HACK
+            v3fixed_t       pos      = { mo->x, mo->y, mo->z };
+            zrefs_t         oldzref  = mo->zref;
+            prevpos_t       oldback  = mo->prevpos;
+            const v2fixed_t vec      = { context->line.v1->x - context->oldLinePos.x,
+                                         context->line.v1->y - context->oldLinePos.y };
+            mo->x                   += FixedMul(vec.x, 72090); // FRACUNIT * 1.1
+            mo->y                   += FixedMul(vec.y, 72090);
+            if(!P_TryMove(mo, pos.x, pos.y, 1))
+            {
+                mo->x = pos.x;
+                mo->y = pos.y;
+                // FIXME: this one needs checking after i figure out
+                // portalmap
+                Polyobj_pushThing(&context->po, &context->line, mo);
+                context->hitthing = true;
+            }
+            else if(context->portalMoves)
+            {
+                PortalAttempt attempt = {};
+                attempt.mobj          = mo;
+                attempt.oldpos        = pos;
+                attempt.oldzref       = oldzref;
+                attempt.oldback       = oldback;
+                attempt.line          = &context->line;
+                context->portalMoves->add(std::move(attempt));
+            }
+        }
+        else
+        {
+            Polyobj_pushThing(&context->po, &context->line, mo);
+            context->hitthing = true;
+        }
+    }
+    return true;
+}
+
 //
 // Polyobj_clipThings
 //
@@ -931,132 +1066,118 @@ static void Polyobj_makeThingCrossSpecialLine(Mobj &mo, line_t &line, const divl
 // portal walls.
 // Returns true if something was hit.
 //
-static bool Polyobj_clipThings(polyobj_t *po, line_t *line, const divline_t &oldLinePos)
+static bool Polyobj_clipThings(polyobj_t *po, line_t *line, const divline_t &oldLinePos,
+                               Collection<PortalAttempt> *portalMoves)
 {
-    bool    hitthing = false;
-    fixed_t linebox[4];
-    int     x, y;
+    ClipThings context = {
+        .po          = *po,
+        .line        = *line,
+        .oldLinePos  = oldLinePos,
+        .hitthing    = false,
+        .portalMoves = portalMoves,
+    };
 
     // adjust linedef bounding box to blockmap, extend by MAXRADIUS
-    linebox[BOXLEFT]   = (line->bbox[BOXLEFT] - bmaporgx - MAXRADIUS) >> MAPBLOCKSHIFT;
-    linebox[BOXRIGHT]  = (line->bbox[BOXRIGHT] - bmaporgx + MAXRADIUS) >> MAPBLOCKSHIFT;
-    linebox[BOXBOTTOM] = (line->bbox[BOXBOTTOM] - bmaporgy - MAXRADIUS) >> MAPBLOCKSHIFT;
-    linebox[BOXTOP]    = (line->bbox[BOXTOP] - bmaporgy + MAXRADIUS) >> MAPBLOCKSHIFT;
+    fixed_t bbox[4];
+    bbox[BOXLEFT]   = line->bbox[BOXLEFT] - MAXRADIUS;
+    bbox[BOXRIGHT]  = line->bbox[BOXRIGHT] + MAXRADIUS;
+    bbox[BOXBOTTOM] = line->bbox[BOXBOTTOM] - MAXRADIUS;
+    bbox[BOXTOP]    = line->bbox[BOXTOP] + MAXRADIUS;
 
     // check all mobj blockmap cells the line contacts
-    for(y = linebox[BOXBOTTOM]; y <= linebox[BOXTOP]; ++y)
-    {
-        for(x = linebox[BOXLEFT]; x <= linebox[BOXRIGHT]; ++x)
-        {
-            if(x < 0 || y < 0 || x >= bmapwidth || y >= bmapheight)
-                continue;
+    P_TransPortalBlockWalker(bbox, line->frontsector->groupid, false, &context, PolyobjIT_clipThings);
 
-            // haleyjd 08/14/10: use modification-safe traversal
-            Mobj *next = nullptr;
-            for(Mobj *mo = blocklinks[y * bmapwidth + x]; mo; mo = next)
-            {
-                next = mo->bnext;
-
-                // always push players even if not solid
-                if(!Polyobj_canPushThing(*mo) || Polyobj_untouched(line, mo))
-                    continue;
-                if(lineCanCarry(*line))
-                {
-                    fixed_t texbot, textop;
-                    P_Get3DMidTexHeights(*line, sides[line->sidenum[0]], texbot, textop, nullptr);
-                    if((mo->z >= textop - STEPSIZE && mo->zref.ceiling - textop >= mo->height) ||
-                       mo->z + mo->height <= texbot)
-                    {
-                        // Polyobj_makeThingCrossSpecialLine(*mo, *line, oldLinePos);
-                        continue;
-                    }
-                }
-                else if(!P_LevelIsVanillaHexen() && !(line->flags & ML_BLOCKING) && (line->flags & ML_TWOSIDED) &&
-                        line->backsector && P_TryMove(mo, mo->x, mo->y, 1))
-                {
-                    // Polyobj_makeThingCrossSpecialLine(*mo, *line, oldLinePos);
-                    continue;
-                }
-
-                // ioanch 20160226: in case of portal lines, just make sure
-                // the mobj budges a bit just to detect the specline
-                if(line->pflags & PS_PASSABLE)
-                {
-                    // HACK
-                    v2fixed_t       pos  = { mo->x, mo->y };
-                    const v2fixed_t vec  = { line->v1->x - oldLinePos.x, line->v1->y - oldLinePos.y };
-                    mo->x               += FixedMul(vec.x, 72090); // FRACUNIT * 1.1
-                    mo->y               += FixedMul(vec.y, 72090);
-                    if(!P_TryMove(mo, pos.x, pos.y, true))
-                    {
-                        mo->x = pos.x;
-                        mo->y = pos.y;
-                        // FIXME: this one needs checking after i figure out
-                        // portalmap
-                        Polyobj_pushThing(po, line, mo);
-                        hitthing = true;
-                    }
-                }
-                else
-                {
-                    Polyobj_pushThing(po, line, mo);
-                    hitthing = true;
-                }
-            }
-        } // end for(x)
-    } // end for(y)
-
-    return hitthing;
+    return context.hitthing;
 }
 
 //
 // Keeps track of portal-polyobject touched things. If position and velocity don't change, then it
 // means the thing may need to be dropped from a departing polyobject
 //
-struct portalthing_t
+class PortalThing
 {
-    Mobj     *thing;           // the touched thing
-    v2fixed_t position;        // the position when touched
-    v2fixed_t velocity;        // the velocity when touched
-    int       interiorgroupid; // the groupid of the portal this mobj touches
+public:
+    MobjReference thing;           // the touched thing
+    v2fixed_t     position;        // the position when touched
+    v2fixed_t     velocity;        // the velocity when touched
+    int           interiorgroupid; // the groupid of the portal this mobj touches
+    const line_t *line;
 };
 
-//
-// If this is a portal polyobject, collect all things on the edge: they may be dropped after moving.
-// Must be called before moving, hence not at the same time as clipThings.
-// Line must be PS_PASSABLE.
-//
-static void Polyobj_collectPortalThings(const polyobj_t &po, const line_t &line, PODCollection<portalthing_t> &things)
+struct collectPortalThings_t
 {
-    I_Assert(line.pflags & PS_PASSABLE, "Expected linked portal\n"); // linked portal
-
-    fixed_t linebox[4];
-    // adjust linedef bounding box to blockmap, extend by MAXRADIUS
-    linebox[BOXLEFT]   = (line.bbox[BOXLEFT] - bmaporgx - MAXRADIUS) >> MAPBLOCKSHIFT;
-    linebox[BOXRIGHT]  = (line.bbox[BOXRIGHT] - bmaporgx + MAXRADIUS) >> MAPBLOCKSHIFT;
-    linebox[BOXBOTTOM] = (line.bbox[BOXBOTTOM] - bmaporgy - MAXRADIUS) >> MAPBLOCKSHIFT;
-    linebox[BOXTOP]    = (line.bbox[BOXTOP] - bmaporgy + MAXRADIUS) >> MAPBLOCKSHIFT;
-
-    // check all mobj blockmap cells the line contacts
-    for(int y = linebox[BOXBOTTOM]; y <= linebox[BOXTOP]; ++y)
-        for(int x = linebox[BOXLEFT]; x <= linebox[BOXRIGHT]; ++x)
+    PODCollection<line_t *>  portalLines;
+    Collection<PortalThing> &things;
+};
+static bool PolyobjIT_collectPortalThings(int x, int y, int groupid, void *data)
+{
+    MobjReference next;
+    auto          context = static_cast<collectPortalThings_t *>(data);
+    for(Mobj *mo = blocklinks[y * bmapwidth + x]; mo; mo = next.get())
+    {
+        next = mo->bnext;
+        if(mo->groupid != groupid || !Polyobj_canPushThing(*mo))
+            continue;
+        int           interiorgroupid = R_NOGROUP;
+        const line_t *portalline      = nullptr;
+        for(const line_t *line : context->portalLines)
         {
-            if(x < 0 || y < 0 || x >= bmapwidth || y >= bmapheight)
+            if(Polyobj_untouched(line, mo))
                 continue;
-
-            Mobj *next;
-            for(Mobj *mo = blocklinks[y * bmapwidth + x]; mo; mo = next)
-            {
-                next = mo->bnext;
-                if(!Polyobj_canPushThing(*mo) || Polyobj_untouched(&line, mo))
-                    continue;
-                portalthing_t &pt = things.addNew();
-                P_SetTarget(&pt.thing, mo);
-                pt.position        = { mo->x, mo->y };
-                pt.velocity        = { mo->momx, mo->momy };
-                pt.interiorgroupid = line.portal->data.link.toid;
-            }
+            interiorgroupid = line->portal->data.link.toid;
+            portalline      = line;
+            break;
         }
+        if(interiorgroupid == R_NOGROUP)
+            continue;
+        PortalThing pt     = {};
+        pt.thing           = mo;
+        pt.position        = { mo->x, mo->y };
+        pt.velocity        = { mo->momx, mo->momy };
+        pt.interiorgroupid = interiorgroupid;
+        pt.line            = portalline;
+        context->things.add(std::move(pt));
+    }
+    return true;
+}
+
+static PODCollection<line_t *> Polyobj_collectLinesBox(const polyobj_t &po, fixed_t bbox[4],
+                                                       bool (*linePredicate)(const line_t &))
+{
+    PODCollection<line_t *> collection;
+    M_ClearBox(bbox);
+    for(int i = 0; i < po.numLines; ++i)
+    {
+        const line_t &line = *po.lines[i];
+        if(!linePredicate(line))
+            continue;
+        collection.add(po.lines[i]);
+        M_AddToBox2(bbox, line.bbox[BOXLEFT], line.bbox[BOXBOTTOM]);
+        M_AddToBox2(bbox, line.bbox[BOXRIGHT], line.bbox[BOXTOP]);
+    }
+    bbox[BOXLEFT]   -= MAXRADIUS;
+    bbox[BOXBOTTOM] -= MAXRADIUS;
+    bbox[BOXRIGHT]  += MAXRADIUS;
+    bbox[BOXTOP]    += MAXRADIUS;
+    return collection;
+}
+
+//
+// If this is a portal polyobject, collect all things on the edges: they may be dropped after moving.
+// Must be called before moving, hence not at the same time as clipThings.
+// Makes sense if it has PS_PASSABLE (linked portal) lines
+//
+static void Polyobj_collectPortalThings(const polyobj_t &po, Collection<PortalThing> &things)
+{
+    if(!po.numLines)
+        return;
+    fixed_t bbox[4];
+
+    collectPortalThings_t context = { .portalLines = Polyobj_collectLinesBox(
+                                          po, bbox, [](const line_t &line) { return !!(line.pflags & PS_PASSABLE); }),
+                                      .things = things };
+
+    P_TransPortalBlockWalker(bbox, po.lines[0]->frontsector->groupid, false, &context, PolyobjIT_collectPortalThings);
 }
 
 //
@@ -1091,6 +1212,12 @@ static bool PolyobjIT_moveObjectsInside(int groupid, void *context)
     return true;
 }
 
+static void Polyobj_updateZRef(Mobj &mobj)
+{
+    P_CheckPosition(&mobj, mobj.x, mobj.y);
+    mobj.zref = clip.zref;
+}
+
 //
 // Moves all airborne objects inside the poly
 //
@@ -1122,8 +1249,7 @@ static void Polyobj_moveObjectsInside(const polyobj_t &po, fixed_t dx, fixed_t d
         if(!p)
         {
             // Make sure to update zref anyway
-            P_CheckPosition(imm.mobj, imm.mobj->x, imm.mobj->y);
-            imm.mobj->zref = clip.zref;
+            Polyobj_updateZRef(*imm.mobj);
         }
         else
             imm.mobj->backupPosition(); // FIXME: do this until we can interpolate polys with portals
@@ -1153,68 +1279,100 @@ static void Polyobj_crossLines(polyobj_t *po, v2fixed_t oldcentre)
         po);
 }
 
-static int polyvalidcount;
-
-inline static bool Polyobj_canCarryThing(const line_t &line, const Mobj &mobj, fixed_t texbot, fixed_t textop)
+static bool Polyobj_canCarryThing(const line_t &line, const Mobj &mobj)
 {
+    if(useportalgroups)
+    {
+        if(line.extflags & EX_ML_BLOCKALL)
+            return mobj.zref.floorline == &line;
+        if(!(mobj.flags & (MF_MISSILE | MF_BOUNCES)))
+        {
+            if(line.flags & ML_BLOCKING ||
+               (mbf21_demo && !(line.flags & ML_RESERVED) && mobj.player && line.flags & ML_BLOCKPLAYERS))
+            {
+                return mobj.zref.floorline == &line;
+            }
+            if((!(line.flags & ML_3DMIDTEX) || line.extflags & EX_ML_WRAPMIDTEX) && P_BlockedAsMonster(mobj) &&
+               (line.flags & ML_BLOCKMONSTERS ||
+                (mbf21_demo && line.flags & ML_BLOCKLANDMONSTERS && !(mobj.flags & MF_FLOAT))))
+            {
+                return mobj.zref.floorline == &line;
+            }
+        }
+        if(P_CheckWrap3DMidTexBlock(line, mobj))
+            return mobj.zref.floorline == &line;
+    }
 
-    return mobj.z <= textop && mobj.z >= textop - STEPSIZE &&
-           (mobj.z != textop || mobj.zref.passfloor != mobj.zref.secfloor) && mobj.zref.ceiling - textop >= mobj.height;
+    if(line.flags & ML_3DMIDTEX)
+    {
+        fixed_t texbot, textop;
+        P_Get3DMidTexHeights(line, sides[line.sidenum[0]], texbot, textop, nullptr);
+
+        return mobj.z <= textop && mobj.z >= textop - STEPSIZE &&
+               (mobj.z != textop || mobj.zref.passfloor != mobj.zref.secfloor) &&
+               mobj.zref.ceiling - textop >= mobj.height;
+    }
+    return false;
 }
 
-static void Polyobj_carry3DMidTexThings(const line_t &line, const vertex_t &vector)
+struct LineRelation
 {
-    // Subtract vector because line was already moved
-    fixed_t linebox[4];
-    linebox[BOXLEFT]   = line.bbox[BOXLEFT] - MAXRADIUS - vector.x;
-    linebox[BOXRIGHT]  = line.bbox[BOXRIGHT] + MAXRADIUS - vector.x;
-    linebox[BOXBOTTOM] = line.bbox[BOXBOTTOM] - MAXRADIUS - vector.y;
-    linebox[BOXTOP]    = line.bbox[BOXTOP] + MAXRADIUS - vector.y;
+    line_t       &line;
+    MobjReference mobj;
+    int           side;
+};
 
-    // Make it portal aware because standing things may be from upper layers
-    P_TransPortalBlockWalker(linebox, line.frontsector->groupid, false, [&line, &vector](int x, int y, int groupid) {
-        struct context_t
+struct ControlThings
+{
+    PODCollection<line_t *>   specialLines;
+    Collection<MobjReference> thingsToCarry;
+    Collection<LineRelation>  linesToCross;
+};
+
+static bool PolyobjIT_collectControlThings(int x, int y, int groupid, void *data)
+{
+    auto context = static_cast<ControlThings *>(data);
+
+    MobjReference next;
+    for(Mobj *mo = blocklinks[y * bmapwidth + x]; mo; mo = next.get())
+    {
+        next = mo->bnext;
+        if(mo->groupid != groupid || mo->flags & MF_NOCLIP)
+            continue;
+        bool addedCarry = false;
+        for(line_t *line : context->specialLines)
         {
-            const line_t   &line;
-            const v2fixed_t vector;
-            fixed_t         texbot, textop;
-        } context = {
-            .line = line, .vector = { vector.x, vector.y }
-        };
+            if(Polyobj_untouched(line, mo))
+                continue;
+            if(!addedCarry && Polyobj_canCarryThing(*line, *mo) && !(mo->flags & (MF_NOSECTOR | MF_NOBLOCKMAP)))
+            {
+                context->thingsToCarry.add(MobjReference(mo));
+                addedCarry = true;
+            }
+            if(line->special && !(mo->flags & MF_TELEPORT))
+            {
+                const linkoffset_t *link = P_GetLinkOffset(mo->groupid, line->frontsector->groupid);
+                context->linesToCross.add(LineRelation{
+                    .line = *line, .mobj = MobjReference(mo), .side = P_PointOnLineSide(mo->x + link->x, mo->y + link->y, line) });
+            }
+        }
+    }
+    return true;
+}
 
-        P_Get3DMidTexHeights(line, sides[line.sidenum[0]], context.texbot, context.textop, nullptr);
+static ControlThings Polyobj_collectControlThings(const polyobj_t &po)
+{
+    fixed_t       bbox[4];
+    ControlThings context = {
+        .specialLines = Polyobj_collectLinesBox(po, bbox, Polyobj_specialLine),
+    };
 
-        return P_BlockThingsIterator(
-            x, y, groupid,
-            [](Mobj *mobj, void *vcontext) {
-                auto context = static_cast<context_t *>(vcontext);
-                // same flags as with P_CheckSector
-                if(mobj->validcount == polyvalidcount || mobj->flags & (MF_NOCLIP | MF_NOSECTOR | MF_NOBLOCKMAP))
-                    return true;
+    if(context.specialLines.isEmpty())
+        return {};
 
-                mobj->x     += context->vector.x;
-                mobj->y     += context->vector.y;
-                bool online  = !Polyobj_untouched(&context->line, mobj);
-                mobj->x     -= context->vector.x;
-                mobj->y     -= context->vector.y;
-                if(!online)
-                    return true;
-
-                if(!Polyobj_canCarryThing(context->line, *mobj, context->texbot, context->textop))
-                    return true;
-
-                mobj->validcount = polyvalidcount;
-
-                if(!P_TryMove(mobj, mobj->x + context->vector.x, mobj->y + context->vector.y, 1))
-                {
-                    P_CheckPosition(mobj, mobj->x, mobj->y);
-                    mobj->zref = clip.zref;
-                }
-
-                return true;
-            },
-            &context);
-    });
+    P_TransPortalBlockWalker(bbox, context.specialLines[0]->frontsector->groupid, false, &context,
+                             PolyobjIT_collectControlThings);
+    return context;
 }
 
 enum class PolyMove
@@ -1239,6 +1397,21 @@ static void Polyobj_applyMovement(polyobj_t *po, PolyMove move)
     Polyobj_updateAnchoredPortals(*po);
 }
 
+static void Polyobj_makeThingsCrossLinesAfterMovement(const ControlThings &controlThings)
+{
+    if(P_LevelIsVanillaHexen())
+        return;
+
+    for(const LineRelation &relation : controlThings.linesToCross)
+    {
+        const linkoffset_t *link = P_GetLinkOffset(relation.mobj->groupid, relation.line.frontsector->groupid);
+        if(relation.side != P_PointOnLineSide(relation.mobj->x + link->x, relation.mobj->y + link->y, &relation.line))
+        {
+            Thinker::AddMobileCrossLine(&relation.line, relation.side, relation.mobj.get());
+        }
+    }
+}
+
 //
 // Polyobj_moveXY
 //
@@ -1257,11 +1430,14 @@ static bool Polyobj_moveXY(polyobj_t *po, fixed_t x, fixed_t y, bool onload = fa
     if(po->flags & POF_ISBAD)
         return false;
 
-    PODCollection<portalthing_t> pts;
-    if(po->numPortals)
-        for(i = 0; i < po->numLines; ++i)
-            if(po->lines[i]->pflags & PS_PASSABLE)
-                Polyobj_collectPortalThings(*po, *po->lines[i], pts);
+    Collection<PortalThing> pts;
+    ControlThings           controlThings;
+    if(!onload)
+    {
+        if(po->hasLinkedPortals)
+            Polyobj_collectPortalThings(*po, pts);
+        controlThings = Polyobj_collectControlThings(*po);
+    }
 
     // ioanch 20160226: update portal position
     Polyobj_moveLinkedPortals(po, x, y, false);
@@ -1286,6 +1462,7 @@ static bool Polyobj_moveXY(polyobj_t *po, fixed_t x, fixed_t y, bool onload = fa
 
     // check for blocking things (yes, it needs to be done separately)
     // ioanch 20160302: do NOT collide and get back if onload = true.
+    Collection<PortalAttempt> portalMoves;
     if(!onload)
         for(i = 0; i < po->numLines; ++i)
         {
@@ -1293,7 +1470,7 @@ static bool Polyobj_moveXY(polyobj_t *po, fixed_t x, fixed_t y, bool onload = fa
             P_MakeDivline(po->lines[i], &oldLinePos);
             oldLinePos.x -= vec.x;
             oldLinePos.y -= vec.y;
-            hitthing     |= Polyobj_clipThings(po, po->lines[i], oldLinePos);
+            hitthing     |= Polyobj_clipThings(po, po->lines[i], oldLinePos, &portalMoves);
         }
 
     if(hitthing)
@@ -1309,6 +1486,30 @@ static bool Polyobj_moveXY(polyobj_t *po, fixed_t x, fixed_t y, bool onload = fa
             Polyobj_relinkLine(*po->lines[i]);
         }
 
+        // Something got hit after some portals ate things, so restore them
+        for(const PortalAttempt &attempt : portalMoves)
+        {
+            P_UnsetThingPosition(attempt.mobj.get());
+            attempt.mobj->x       = attempt.oldpos.x;
+            attempt.mobj->y       = attempt.oldpos.y;
+            attempt.mobj->z       = attempt.oldpos.z;
+            attempt.mobj->zref    = attempt.oldzref;
+            attempt.mobj->prevpos = attempt.oldback;
+            P_SetThingPosition(attempt.mobj.get());
+            P_AdjustFloorClip(attempt.mobj.get());
+            for(DLListItem<spriteprojnode_t> *proj = attempt.mobj->spriteproj; proj; proj = proj->dllNext)
+            {
+                if(proj->dllObject->portalline != attempt.line)
+                    continue;
+                // proj->dllObject->shiftedcoord.x += x;
+                // proj->dllObject->shiftedcoord.y += y;
+                proj->dllObject->delta.x       += x;
+                proj->dllObject->delta.y       += y;
+                proj->dllObject->directdelta.x += x;
+                proj->dllObject->directdelta.y += y;
+            }
+        }
+
         // ioanch 20160226: update portal position
         // CAREFUL: do not replace this and the previous call to a single call,
         // because there's a lot of stuff going on in Polyobj_clipThings (e.g. things eaten by
@@ -1322,35 +1523,27 @@ static bool Polyobj_moveXY(polyobj_t *po, fixed_t x, fixed_t y, bool onload = fa
         po->spawnSpot.y += vec.y;
 
         // 04/19/09: translate sound origins
-        ++polyvalidcount;
         for(i = 0; i < po->numLines; ++i)
         {
             po->lines[i]->soundorg.x += vec.x;
             po->lines[i]->soundorg.y += vec.y;
-
-            if(onload || !lineCanCarry(*po->lines[i]))
-            {
-                continue;
-            }
-
-            Polyobj_carry3DMidTexThings(*po->lines[i], vec);
         }
 
         Polyobj_applyMovement(po, onload ? PolyMove::teleport : PolyMove::travel);
 
-        for(const portalthing_t &pt : pts)
+        for(const PortalThing &pt : pts)
         {
             // Object was neither teleported by portal nor pushed by solid wall
             if(pt.thing->x == pt.position.x && pt.thing->y == pt.position.y && pt.thing->momx == pt.velocity.x &&
                pt.thing->momy == pt.velocity.y)
             {
                 // We got one which we may want to move
-                if(P_mobjOnSurface(*pt.thing) && pt.thing->zref.floorgroupid == pt.interiorgroupid)
+                if(P_mobjOnSurface(*pt.thing.get()) && pt.thing->zref.floorgroupid == pt.interiorgroupid)
                 {
-                    if(!P_TryMove(pt.thing, pt.thing->x + x, pt.thing->y + y, 1))
+                    if(!P_TryMove(pt.thing.get(), pt.thing->x + x, pt.thing->y + y, 1))
                     {
-                        P_CheckPosition(pt.thing, pt.thing->x, pt.thing->y);
-                        pt.thing->zref = clip.zref; // If couldn't move, still adjust Z references
+                        // If couldn't move, still adjust Z references
+                        Polyobj_updateZRef(*pt.thing.get());
                     }
                     else
                         pt.thing->backupPosition(); // FIXME: temporary until we interpolate polyportals
@@ -1358,18 +1551,18 @@ static bool Polyobj_moveXY(polyobj_t *po, fixed_t x, fixed_t y, bool onload = fa
                 else
                 {
                     // Floating things still need zref updating
-                    P_CheckPosition(pt.thing, pt.thing->x, pt.thing->y);
-                    pt.thing->zref = clip.zref;
+                    Polyobj_updateZRef(*pt.thing.get());
                 }
             }
         }
+        for(MobjReference &mobj : controlThings.thingsToCarry)
+            if(!P_TryMove(mobj.get(), mobj->x + vec.x, mobj->y + vec.y, 1))
+                Polyobj_updateZRef(*mobj.get());
+        Polyobj_makeThingsCrossLinesAfterMovement(controlThings);
         // Now move the airborne things inside the polyobject portal, except for the ceiling hangers
-        Polyobj_moveObjectsInside(*po, -x, -y);
+        if(!onload)
+            Polyobj_moveObjectsInside(*po, -x, -y);
     }
-
-    // Remember to clear reference
-    for(portalthing_t &pt : pts)
-        P_ClearTarget(pt.thing);
 
     return !hitthing;
 }
@@ -1437,6 +1630,11 @@ void Polyobj_MoveToXY(polyobj_t *po, fixed_t x, fixed_t y)
     }
 
     Polyobj_applyMovement(po, PolyMove::teleport);
+}
+
+bool Polyobj_IsLine(const line_t &line)
+{
+    return demo_version >= 406 && !P_LevelIsVanillaHexen() && line.intflags & MLI_DYNASEGLINE;
 }
 
 //
@@ -1516,67 +1714,6 @@ static void Polyobj_rotateLine(line_t *ld)
         P_MakeLineNormal(ld);
 }
 
-struct mobjmove_t
-{
-    Mobj     *mobj;
-    v2fixed_t vector;
-};
-
-static void Polyobj_collect3DMidTexThingsToRotate(const polyobj_t &po, const line_t &line, const angle_t angle,
-                                                  PODCollection<mobjmove_t> &collection)
-{
-    fixed_t linebox[4];
-    linebox[BOXLEFT]   = line.bbox[BOXLEFT] - MAXRADIUS;
-    linebox[BOXRIGHT]  = line.bbox[BOXRIGHT] + MAXRADIUS;
-    linebox[BOXBOTTOM] = line.bbox[BOXBOTTOM] - MAXRADIUS;
-    linebox[BOXTOP]    = line.bbox[BOXTOP] + MAXRADIUS;
-
-    // Make it portal aware because standing things may be from upper layers
-    P_TransPortalBlockWalker(
-        linebox, line.frontsector->groupid, false, [angle, &line, &po, &collection](int x, int y, int groupid) {
-            struct context_t
-            {
-                const angle_t              angle;
-                const v2fixed_t            center;
-                const line_t              &line;
-                PODCollection<mobjmove_t> &collection;
-                fixed_t                    texbot, textop;
-            } context = {
-                .angle = angle, .center = { po.spawnSpot.x, po.spawnSpot.y },
-                     .line = line, .collection = collection
-            };
-
-            P_Get3DMidTexHeights(line, sides[line.sidenum[0]], context.texbot, context.textop, nullptr);
-
-            return P_BlockThingsIterator(
-                x, y, groupid,
-                [](Mobj *mobj, void *vcontext) {
-                    auto context = static_cast<context_t *>(vcontext);
-                    // same flags as with P_CheckSector
-                    if(mobj->validcount == polyvalidcount || mobj->flags & (MF_NOCLIP | MF_NOSECTOR | MF_NOBLOCKMAP) ||
-                       Polyobj_untouched(&context->line, mobj))
-                    {
-                        return true;
-                    }
-
-                    if(!Polyobj_canCarryThing(context->line, *mobj, context->texbot, context->textop))
-                        return true;
-
-                    mobj->validcount = polyvalidcount;
-
-                    mobjmove_t move = {};
-                    P_SetTarget(&move.mobj, mobj);
-                    vertex_t rotinfo = { .x = mobj->x - context->center.x, .y = mobj->y - context->center.y };
-                    Polyobj_rotatePoint(rotinfo, context->center, context->angle >> ANGLETOFINESHIFT);
-                    move.vector.x = rotinfo.x - mobj->x;
-                    move.vector.y = rotinfo.y - mobj->y;
-                    context->collection.add(move);
-                    return true;
-                },
-                &context);
-        });
-}
-
 //
 // Polyobj_rotate
 //
@@ -1598,18 +1735,9 @@ static bool Polyobj_rotate(polyobj_t *po, angle_t delta, bool onload = false)
     origin.x = po->spawnSpot.x;
     origin.y = po->spawnSpot.y;
 
-    PODCollection<mobjmove_t> thingsToCarry;
+    ControlThings controlThings;
     if(!onload)
-    {
-        ++polyvalidcount;
-        for(i = 0; i < po->numLines; ++i)
-        {
-            if(!lineCanCarry(*po->lines[i]))
-                continue;
-
-            Polyobj_collect3DMidTexThingsToRotate(*po, *po->lines[i], delta, thingsToCarry);
-        }
-    }
+        controlThings = Polyobj_collectControlThings(*po);
 
     // save current positions and rotate all vertices
     PODCollection<vertex_t> restoreVertices;
@@ -1642,7 +1770,7 @@ static bool Polyobj_rotate(polyobj_t *po, angle_t delta, bool onload = false)
     // ioanch 20160302: do NOT collide if onload = true.
     if(!onload)
         for(i = 0; i < po->numLines; ++i)
-            hitthing |= Polyobj_clipThings(po, po->lines[i], linesBeforeMove[i]);
+            hitthing |= Polyobj_clipThings(po, po->lines[i], linesBeforeMove[i], nullptr);
 
     if(hitthing)
     {
@@ -1664,21 +1792,19 @@ static bool Polyobj_rotate(polyobj_t *po, angle_t delta, bool onload = false)
 
         Polyobj_applyMovement(po, onload ? PolyMove::teleport : PolyMove::travel);
 
-        for(const mobjmove_t &move : thingsToCarry)
+        for(MobjReference &mobj : controlThings.thingsToCarry)
         {
-            if(!P_TryMove(move.mobj, move.mobj->x + move.vector.x, move.mobj->y + move.vector.y, 1))
-            {
-                P_CheckPosition(move.mobj, move.mobj->x, move.mobj->y);
-                move.mobj->zref = clip.zref;
-            }
-            move.mobj->angle += delta;
-        }
-    }
+            const linkoffset_t *link = P_GetLinkOffset(mobj->groupid, po->lines[0]->frontsector->groupid);
 
-    // Remember to clear targets!
-    for(mobjmove_t &move : thingsToCarry)
-    {
-        P_ClearTarget(move.mobj);
+            vertex_t rotinfo = { .x = mobj->x + link->x - origin.x, .y = mobj->y + link->y - origin.y };
+            Polyobj_rotatePoint(rotinfo, origin, delta >> ANGLETOFINESHIFT);
+            rotinfo.x -= link->x;
+            rotinfo.y -= link->y;
+            if(!P_TryMove(mobj.get(), rotinfo.x, rotinfo.y, 1))
+                Polyobj_updateZRef(*mobj.get());
+            mobj->angle += delta;
+        }
+        Polyobj_makeThingsCrossLinesAfterMovement(controlThings);
     }
 
     return !hitthing;
